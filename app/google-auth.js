@@ -2,7 +2,7 @@ const fs = require('fs')
 
 const {google} = require('googleapis')
 
-const init = (scope, askCb, clientCb) => {
+const init = (scopes, askCb, clientCb) => {
     // read shared secret
     fs.readFile(
         'client_secret.json',
@@ -22,7 +22,7 @@ const init = (scope, askCb, clientCb) => {
             fs.readFile(
                 'token.json',
                 (err, buf) => {
-                    if (err) return get(client, scope, askCb, clientCb)
+                    if (err) return get(client, scopes, askCb, clientCb)
                     const data = JSON.parse(buf)
                     client.setCredentials(data)
                     clientCb(null, client)
@@ -32,13 +32,9 @@ const init = (scope, askCb, clientCb) => {
     )
 }
 
-const get = (client, scope, askCb, clientCb) => {
-    const authUrl = client.generateAuthUrl(
-        {
-            access_type: 'offline',
-            scope
-        }
-    )
+const get = (client, scopes, askCb, clientCb) => {
+    const authOpts = {scope: scopes, access_type: 'offline'}
+    const authUrl = client.generateAuthUrl(authOpts)
     // ask user to go to url and get the code
     askCb(
         authUrl,

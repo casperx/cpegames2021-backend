@@ -1,47 +1,99 @@
 const fs = require('fs')
-const util = require('util')
+const path = require('path')
+
+const datetime = require('date-and-time')
 
 const express = require('express')
 const cors = require('cors')
+
 const mustacheExpress = require('mustache-express')
 
 const {google} = require('googleapis')
 const googleAuth = require('./google-auth')
+const { file } = require('googleapis/build/src/apis/file')
 
-const datetime = require('date-and-time')
-
-let conf = JSON.parse(fs.readFileSync('config.json'))
-
-let sheetId = conf.sheetId
-let authClient
+const dirOpts = {depth: 99}
 
 const app = express()
+
 app.use(cors())
+
+const urlEncOpts = {extended: false}
+app.use(express.urlencoded(urlEncOpts))
 app.use(express.json())
-app.use(
-    express.urlencoded(
-        {
-            extended: false
-        }
-    )
-)
 
 const engine = mustacheExpress()
-app.engine('mustache', engine)
-app.set('view engine', 'mustache')
-app.set('views', 'views')
+// register engine and use engine name as
+// file extension of views file
+app.engine('tmpl', engine)
+app.set('view engine', 'tmpl') // set default extension of views file
+app.set('views', 'views') // set default views file path
+
+app.listen(3000, () => console.log('server started'))
+
+const undefToNull = (k, v) => v === undefined ? null : v
+
+const idlePeriodic = (cb, period) => {
+    let handle
+    const wrap = (...args) => {
+        const again = (...args) => {
+            if (handle) clearTimeout(handle)
+            handle = setTimeout(
+                () => wrap(...args),
+                period
+            )
+        }
+        cb(again, ...args)
+    }
+    return wrap
+}
+
+const aggregateCb = (cb) => {
+    let cnt = 0
+    const store = {}
+    return (name, detail) => {
+        ++cnt
+        return (err, val) => {
+            if (cnt === 0) return
+            if (err) {
+                cnt = 0
+                const pack = {name, detail}
+                return cb(err, pack)
+            }
+            store[name] = val
+            if (--cnt === 0) cb(null, store)
+        }
+    }
+}
+
+const aggregator = aggregateCb(
+    (err, res) => {
+        if (err) {
+            const {name, detail} = res
+            return console.error(`${detail} failed`, err)
+        }
+        const {conf, auth} = res
+        main(conf, auth)
+    }
+)
+
+const confAgg = aggregator('conf', 'read config file')
+
+fs.readFile(
+    'config.json',
+    (err, buf) => {
+        if (err) return confAgg(err)
+        const data = JSON.parse(buf)
+        confAgg(null, data)
+    }
+)
 
 googleAuth(
     ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     (url, cb) => {
         let used = false
         const handler = (req, res) => {
-            // stop repeat initialization
-            if (used) {
-                res.status(400)
-                res.send('already set up')
-                return
-            }
+            if (used) return res.sendStatus(404)
             if (req.method === 'POST') {
                 const code = req.body.code
                 cb(
@@ -59,301 +111,210 @@ googleAuth(
                 return
             }
             const data = {url}
-            res.render('init', data)
+            res.render('gg-auth', data)
         }
-        // expose init endpoint
-        app.get('/init', handler)
-        app.post('/init', handler)
+        app.get('/gg-auth', handler)
+        app.post('/gg-auth', handler)
     },
-    (err, auth) => {
-        if (err) return console.error('cannot get aauth client')
-
-        authClient = auth
-        // start sync
-        syncScore(
-            (err) => {
-                if (err) return console.error('init save score failed', err)
-                console.log('init save score success')
-            }
-        )
-        syncAnnounce(
-            (err) => {
-                if (err) return console.error('init save announce failed', err)
-                console.log('init save announce success')
-            }
-        )
-        syncSchedule(
-            (err) => {
-                if (err) return console.error('init save schedule failed', err)
-                console.log('init save schedule success')
-            }
-        )
-    }
+    aggregator('auth', 'get auth client')
 )
-
-const updateRoute = express.Router()
-
-// check for auth client before fetch
-app.use(
-    '/update',
-    (req, res, next) => {
-        if (authClient) return next()
-        res.redirect('/init')
-    },
-    updateRoute
-)
-
-updateRoute.get(
-    '/score',
-    (req, res) => {
-        syncScore(
-            (err) => {
-                if (err) return res.status(500).send('save score failed')
-                res.send('save score success')
-            }
-        )
-    }
-)
-
-updateRoute.get(
-    '/announce',
-    (req, res) => {
-        syncAnnounce(
-            (err) => {
-                if (err) return res.status(500).send('save announce failed')
-                res.send('save announce success')
-            }
-        )
-    }
-)
-
-updateRoute.get(
-    '/result',
-    (req, res) => {
-        syncSchedule(
-            (err) => {
-                if (err) return res.status(500).send('save schedule failed')
-                res.send('save schedule success')
-            }
-        )
-    }
-)
-
-// cache instances
-let _sheetSvc
-const sheetSvc = (auth) => {
-    if (_sheetSvc) return _sheetSvc
-    const sheets = google.sheets(
-        {
-            version: 'v4',
-            auth: authClient
-        }
-    )
-    return _sheetSvc = sheets.spreadsheets
-}
-
-let _sheetVals
-const sheetVals = () => {
-    if (_sheetVals) return _sheetVals
-    const svc = sheetSvc()
-    return _sheetVals = svc.values
-}
-
-const sheetData = (id, range, cb) => {
-    const vals = sheetVals()
-    vals.get(
-        {
-            spreadsheetId: id,
-            range
-        },
-        (err, resp) => {
-            if (err) return cb(err, null)
-            cb(null, resp.data)
-        }
-    )
-}
-
-// sync functions
-let syncScoreTimer
-const syncScore = (cb) => {
-    // cancel pending timer before set new one
-    if (syncScoreTimer) clearTimeout(syncScoreTimer)
-    // call itself periodically
-    syncScoreTimer = setTimeout(
-        () => syncScore(
-            (err) => {
-                if (err) return console.error('periodically save score failed')
-                console.log('periodically save score success')
-            }
-        ),
-        10 * 60 * 1000 // every 10 minute
-    )
-    sheetData(
-        sheetId,
-        'Score!A2:C',
-        (err, res) => {
-            if (err) return cb(err)
-            // dummy value in case of empty sheet
-            const rows = res.values ?? [
-                [0, 'plant', 'dummy'],
-                [0, 'zombie', 'dummy']
-            ]
-            // transform
-            const reduced = {}
-            for (const [scoreText, team, reason] of rows) {
-                const score = parseInt(scoreText, 10)
-                let teamItem
-                if (team in reduced) {
-                    teamItem = reduced[team]
-                } else {
-                    teamItem = reduced[team] = {
-                        total: 0,
-                        log: []
-                    }
-                }
-                // accumulate
-                teamItem.total += score
-                teamItem.log.push(
-                    {
-                        score,
-                        reason
-                    }
-                )
-            }
-            fs.writeFile(
-                'data/score.json',
-                JSON.stringify(reduced),
-                cb
-            )
-        }
-    )
-}
-
-let syncAnnounceTimer
-const syncAnnounce = (cb) => {
-    // cancel pending timer before set new one
-    if (syncAnnounceTimer) clearTimeout(syncAnnounceTimer)
-    // call itself periodically
-    syncAnnounceTimer = setTimeout(
-        () => syncAnnounce(
-            (err) => {
-                if (err) return console.error('periodically save announce failed')
-                console.log('periodically save announce success')
-            }
-        ),
-        10 * 60 * 1000 // 10 minutes
-    )
-    sheetData(
-        sheetId,
-        'Announce!A2:A',
-        (err, res) => {
-            if (err) return cb(err)
-            // dummy value in case of empty sheet
-            const rows = res.values ?? [['']]
-            const cleanRows = rows.map(
-                (item) => item[0]
-            )
-            fs.writeFile(
-                'data/announce.json',
-                JSON.stringify(cleanRows),
-                cb
-            )
-        }
-    )
-}
 
 const dateFormat = datetime.compile('D/M/Y H:m Z')
 
-let syncScheduleTimer
-const syncSchedule = (cb) => {
-    // cancel pending timer before set new one
-    if (syncScheduleTimer) clearTimeout(syncScheduleTimer)
-    // call itself periodically
-    syncScheduleTimer = setTimeout(
-        () => syncSchedule(
-            (err) => {
-                if (err) return console.error('periodically save schedule failed')
-                console.log('periodically save schedule success')
-            }
-        ),
-        30 * 60 * 1000 // 30 minutes
-    )
-    sheetData(
-        sheetId,
-        'Result!A2:G',
-        (err, res) => {
-            if (err) return cb(err)
-            // dummy value in case of empty sheet
-            const rows = res.values ?? [
-                ['1/1/1', '7:0', 'http://google.com', 'minecraft', 'left', 'right', 'draw']
-            ]
-            // transform
-            const cleanedRows = rows.map(
-                (row) => {
-                    const [
-                        dateText,
-                        timeText,
-                        stream,
-                        game,
-                        teamL,
-                        teamR,
-                        result
-                    ] = row
-                    const schedule = datetime.parse(`${dateText} ${timeText} +0700`, dateFormat)
-                    return {
-                        schedule,
-                        stream,
-                        game,
-                        teamL,
-                        teamR,
-                        result
-                    }
-                }
-            ).sort(
-                (left, right) => {
-                    const elapse = datetime.subtract(left.schedule, right.schedule)
-                    return elapse.toMilliseconds()
-                }
-            )
-            // filter
-            const now = new Date()
-            const incomingOffset = cleanedRows.findIndex(
-                (row) => {
-                    const elapse = datetime.subtract(now, row.schedule)
-                    return elapse.toMilliseconds() < 0
-                }
-            )
-            const liveSource = incomingOffset === -1 ? cleanedRows.reverse() : cleanedRows.slice(incomingOffset)
-            const live = liveSource.find(
-                (row) => !!row.stream
-            )
+const main = (conf, auth) => {
+    const opts = {auth}
+    google.options(opts)
 
-            // aggregate callbacks into 1
-            let aggCount = 2
-            const aggCb = (err) => {
-                if (aggCount > 0) {
-                    if (err) {
-                        aggCount = 0
-                        return cb(err)
-                    }
-                    if (--aggCount === 0) cb(null)
-                }
-            }
+    const mainSheetId = conf.sheetId
 
-            fs.writeFile(
-                'data/result.json',
-                JSON.stringify(cleanedRows),
-                aggCb
-            )
-            fs.writeFile(
-                'data/live.json',
-                JSON.stringify(live),
-                aggCb
-            )
+    const sheetsSvc = google.sheets('v4')
+    const sheetsVals = sheetsSvc.spreadsheets.values
+
+    const readSheets = (spreadsheetId, range, cb) => {
+        sheetsVals.get(
+            {spreadsheetId, range},
+            (err, resp) => {
+                if (err) return cb(err, null)
+                const {data} = resp
+                cb(null, data)
+            }
+        )
+    }
+
+    const reportConsole = (name) => (err) => {
+        if (err) return console.error(`sync ${name} failed`, err)
+        console.log(`sync ${name} success`)
+    }
+
+    const handleHttp = (name, sub) => (req, res) => sub(
+        (err) => {
+            if (err) {
+                res.status(500)
+                res.send(`sync ${name} failed`)
+                return
+            }
+            res.send(`sync ${name} success`)
         }
     )
+
+    const reportAnnounceConsole = reportConsole('announce')
+    const reportScoreConsole = reportConsole('score')
+    const reportCompetConsole = reportConsole('competition')
+
+    const announceFile = path.join(conf.staticPath, 'announce.json')
+    const scoreFile = path.join(conf.staticPath, 'score.json')
+    const liveFile = path.join(conf.staticPath, 'live.json')
+    const competFile = path.join(conf.staticPath, 'compet.json')
+
+    const annouceReducer = (values) => values.slice(-1).map(
+        (item) => {
+            const [message] = item
+            return {message}
+        }
+    )
+
+    const scoreReducer = (values) => {
+        const summed = {}
+        for (const [scoreText, team, reason] of values) {
+            const score = parseInt(scoreText, 10)
+            const acc =
+                team in summed ?
+                summed[team] :
+                summed[team] = {log: [], total: 0}
+            const pack = {score, reason}
+            acc.total += score
+            acc.log.push(pack)
+        }
+        return summed
+    }
+
+    const syncAnnounce = idlePeriodic(
+        (again, cb) => readSheets(
+            mainSheetId,
+            'Announce!A2:A',
+            (err, res) => {
+                if (err) {
+                    cb(err)
+                    again(reportAnnounceConsole)
+                    return
+                }
+                const {values} = res
+                const reduced = values ? annouceReducer(values) : []
+                fs.writeFile(announceFile, JSON.stringify(reduced), cb)
+                again(reportAnnounceConsole)
+            }
+        ),
+        1000 * 60 * 10 // 10 minutes
+    )
+
+    const syncScore = idlePeriodic(
+        (again, cb) => readSheets(
+            mainSheetId,
+            'Score!A2:C',
+            (err, res) => {
+                if (err) {
+                    cb(err)
+                    again(reportScoreConsole)
+                    return
+                }
+                const {values} = res
+                const reduced = values ? scoreReducer(values) : {
+                    plant: {log: [], total: 0},
+                    zombie: {log: [], total: 0}
+                }
+                fs.writeFile(scoreFile, JSON.stringify(reduced), cb)
+                again(reportScoreConsole)
+            }
+        ),
+        1000 * 60 * 20 // 20 minutes
+    )
+
+    const syncCompet = idlePeriodic(
+        (again, cb) => readSheets(
+            mainSheetId,
+            'Competition!A2:G',
+            (err, res) => {
+                if (err) {
+                    cb(err)
+                    again(reportCompetConsole)
+                    return
+                }
+                const {values} = res
+                const cleaned = !values ? [] : values.map(
+                    (row) => {
+                        const [
+                            dateText,
+                            timeText,
+                            game,
+                            teamLeft,
+                            teamRight,
+                            result,
+                            stream
+                        ] = row
+                        const schedule = datetime.parse(
+                            `${dateText} ${timeText} +0700`,
+                            dateFormat
+                        )
+                        return {
+                            schedule,
+                            game,
+                            teamLeft,
+                            teamRight,
+                            result,
+                            stream
+                        }
+                    }
+                ).sort(
+                    (left, right) => {
+                        const elapse = datetime.subtract(
+                            left.schedule,
+                            right.schedule
+                        )
+                        return elapse.toMilliseconds()
+                    }
+                )
+                const now = new Date()
+                const incomingOffset = cleaned.findIndex(
+                    (row) => {
+                        const elapse = datetime.subtract(now, row.schedule)
+                        return elapse.toMilliseconds() < 0
+                    }
+                )
+                const liveSource =
+                    incomingOffset === -1 ?
+                    cleaned.reverse() :
+                    cleaned.slice(incomingOffset)
+                const availLive = liveSource.find((row) => !!row.stream)
+                const aggregator = aggregateCb(cb)
+                fs.writeFile(
+                    liveFile,
+                    JSON.stringify(availLive, undefToNull),
+                    aggregator('live', 'write live file')
+                )
+                fs.writeFile(
+                    competFile,
+                    JSON.stringify(cleaned),
+                    aggregator('compet', 'write competition file')
+                )
+                again(reportCompetConsole)
+            }
+        ),
+        1000 * 60 * 60 // 1 hour
+    )
+
+    syncAnnounce(reportAnnounceConsole)
+    syncScore(reportScoreConsole)
+    syncCompet(reportCompetConsole)
+
+    const updateRoute = express.Router()
+
+    app.use('/update', updateRoute)
+
+    const handleAnnounceHttp = handleHttp('announce', syncAnnounce)
+    const handleScoreHttp = handleHttp('score', syncScore)
+    const handleCompetHttp = handleHttp('competition', syncCompet)
+
+    updateRoute.get('/announce', handleAnnounceHttp)
+    updateRoute.get('/score', handleScoreHttp)
+    updateRoute.get('/compet', handleCompetHttp)
 }
-
-const port = process.env.PORT ?? 3000
-
-app.listen(port, () => console.log(`server is running on port ${port}`))

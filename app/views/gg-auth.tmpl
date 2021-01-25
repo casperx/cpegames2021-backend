@@ -1,9 +1,12 @@
 <!DOCTYPE html>
 <html>
     <head>
-        <title>Init Application</title>
+        <title>Google Auth</title>
         <meta charset="utf-8">
         <style>
+            .baseline {
+                vertical-align: baseline;
+            }
             .red {
                 color: red;
             }
@@ -11,9 +14,8 @@
     </head>
     <body>
         <form method="post">
-            <p>Sheet ID <input type="text" name="sheet" /></p>
             <p>Please go to this <a href="{{url}}" target="_new">URL</a> and proceed to get auth code.</p>
-            <p>Code <input type="text" name="code" /></p>
+            <p>Code <textarea name="code" rows="3" cols="20" class="baseline"></textarea></p>
             <p class="red">If you don't get auth code, our app can't read your sheet.</p>
             <p><button>send</button><p>
         </form>
