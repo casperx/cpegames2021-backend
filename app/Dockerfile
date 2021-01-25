@@ -1,6 +1,7 @@
-FROM python:3.6
+FROM node:14-alpine
 WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt
-CMD ["python", "main.py"]
-EXPOSE 8000
+COPY package*.json ./
+RUN npm i
+COPY . ./
+CMD ["npm", "start"]
+EXPOSE 3000

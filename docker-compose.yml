@@ -2,9 +2,15 @@ version: "3.1"
 services:
     app:
         build: app
+        volumes:
+          - generated:/app/data
     nginx:
         build: nginx
         ports:
             - "80:80"
         depends_on:
             - app
+        volumes:
+          - generated:/data
+volumes:
+    generated:
