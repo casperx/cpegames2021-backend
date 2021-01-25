@@ -6,7 +6,7 @@ const cors = require('cors')
 const mustacheExpress = require('mustache-express')
 
 const {google} = require('googleapis')
-const googleAuth = require('./googleAuth')
+const googleAuth = require('./google-auth')
 
 const datetime = require('date-and-time')
 
@@ -67,7 +67,7 @@ googleAuth(
     },
     (err, auth) => {
         if (err) return console.error('cannot get aauth client')
-        
+
         authClient = auth
         // start sync
         syncScore(
