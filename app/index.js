@@ -66,6 +66,8 @@ googleAuth(
         app.post('/init', handler)
     },
     (err, auth) => {
+        if (err) return console.error('cannot get aauth client')
+        
         authClient = auth
         // start sync
         syncScore(
