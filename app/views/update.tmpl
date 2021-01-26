@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>Update</title>
+        <meta charset="utf-8">
+        <base href="/update/">
+    </head>
+    <body>
+        <p>Update</p>
+        {{#endpoints}}
+        <form method="post" action="{{name}}">
+            <button>{{label}}</button>
+        </form>
+        {{/endpoints}}
+    </body>
+</html>

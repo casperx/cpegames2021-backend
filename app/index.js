@@ -10,9 +10,6 @@ const mustacheExpress = require('mustache-express')
 
 const {google} = require('googleapis')
 const googleAuth = require('./google-auth')
-const { file } = require('googleapis/build/src/apis/file')
-
-const dirOpts = {depth: 99}
 
 const app = express()
 
@@ -20,7 +17,6 @@ app.use(cors())
 
 const urlEncOpts = {extended: false}
 app.use(express.urlencoded(urlEncOpts))
-app.use(express.json())
 
 const engine = mustacheExpress()
 // register engine and use engine name as
@@ -31,19 +27,17 @@ app.set('views', 'views') // set default views file path
 
 app.listen(3000, () => console.log('server started'))
 
-const undefToNull = (k, v) => v === undefined ? null : v
-
 const idlePeriodic = (cb, period) => {
     let handle
     const wrap = (...args) => {
-        const again = (...args) => {
+        const next = (...args) => {
             if (handle) clearTimeout(handle)
             handle = setTimeout(
                 () => wrap(...args),
                 period
             )
         }
-        cb(again, ...args)
+        cb(next, ...args)
     }
     return wrap
 }
@@ -111,15 +105,16 @@ googleAuth(
                 return
             }
             const data = {url}
-            res.render('gg-auth', data)
+            res.render('auth', data)
         }
-        app.get('/gg-auth', handler)
-        app.post('/gg-auth', handler)
+        app.get('/auth', handler)
+        app.post('/auth', handler)
     },
     aggregator('auth', 'get auth client')
 )
 
-const dateFormat = datetime.compile('D/M/Y H:m Z')
+const dateTimeFormat = datetime.compile('D/M/Y H:m Z')
+const parseDateTime = (s) => datetime.parse(`${s} +0700`, dateTimeFormat)
 
 const main = (conf, auth) => {
     const opts = {auth}
@@ -142,7 +137,10 @@ const main = (conf, auth) => {
     }
 
     const reportConsole = (name) => (err) => {
-        if (err) return console.error(`sync ${name} failed`, err)
+        if (err) {
+            console.error(`sync ${name} failed`, err)
+            return
+        }
         console.log(`sync ${name} success`)
     }
 
@@ -157,19 +155,72 @@ const main = (conf, auth) => {
         }
     )
 
-    const reportAnnounceConsole = reportConsole('announce')
-    const reportScoreConsole = reportConsole('score')
-    const reportCompetConsole = reportConsole('competition')
+    const staticPath = 'data'
 
-    const announceFile = path.join(conf.staticPath, 'announce.json')
-    const scoreFile = path.join(conf.staticPath, 'score.json')
-    const liveFile = path.join(conf.staticPath, 'live.json')
-    const competFile = path.join(conf.staticPath, 'compet.json')
+    const reportAnnounce = reportConsole('announce')
+    const reportScore = reportConsole('score')
+    const reportLive = reportConsole('live')
+    const reportCompet = reportConsole('competition')
 
-    const annouceReducer = (values) => values.slice(-1).map(
-        (item) => {
-            const [message] = item
-            return {message}
+    const announceFile = path.join(staticPath, 'announce.json')
+    const scoreFile = path.join(staticPath, 'score.json')
+    const liveFile = path.join(staticPath, 'live.json')
+    const competFile = path.join(staticPath, 'compet.json')
+
+    const annouceReducer = (values) => {
+        const [last] = values.slice(-1).map(
+            (item) => {
+                const [message] = item
+                return {message}
+            }
+        )
+        return last
+    }
+
+    const liveReducer = (values) => {
+        const cleaned = !values ? [] : values.map(
+            (row) => {
+                const [dateText, timeText, stream] = row
+                const schedule = parseDateTime(`${dateText} ${timeText}`)
+                return {schedule, stream}
+            }
+        ).sort(
+            (left, right) => {
+                const elapse = datetime.subtract(
+                    left.schedule,
+                    right.schedule
+                )
+                return elapse.toMilliseconds()
+            }
+        )
+        const now = new Date()
+        // find live that is going to show in 10 minute
+        const nextIndex = cleaned.findIndex(
+            (row) => {
+                const elapse = datetime.subtract(now, row.schedule)
+                return elapse.toMinutes() < 10
+            }
+        )
+        const live =
+            nextIndex === -1 ?
+            cleaned[cleaned.length - 1] :
+            cleaned[nextIndex]
+        return live
+    }
+
+    const competReducer = (values) => values.map(
+        (row) => {
+            const [dateText, timeText, game, teamLeft,teamRight, result] = row
+            const schedule = parseDateTime(`${dateText} ${timeText}`)
+            return {schedule, game, teamLeft, teamRight, result}
+        }
+    ).sort(
+        (left, right) => {
+            const elapse = datetime.subtract(
+                left.schedule,
+                right.schedule
+            )
+            return elapse.toMilliseconds()
         }
     )
 
@@ -189,132 +240,102 @@ const main = (conf, auth) => {
     }
 
     const syncAnnounce = idlePeriodic(
-        (again, cb) => readSheets(
-            mainSheetId,
-            'Announce!A2:A',
-            (err, res) => {
-                if (err) {
-                    cb(err)
-                    again(reportAnnounceConsole)
-                    return
+        (next, cb) => {
+            readSheets(
+                mainSheetId,
+                'Announce!A2:A',
+                (err, res) => {
+                    if (err) return cb(err)
+                    const {values} = res
+                    const reduced = values ? annouceReducer(values) : null
+                    fs.writeFile(announceFile, JSON.stringify(reduced), cb)
                 }
-                const {values} = res
-                const reduced = values ? annouceReducer(values) : []
-                fs.writeFile(announceFile, JSON.stringify(reduced), cb)
-                again(reportAnnounceConsole)
-            }
-        ),
+            )
+            next(reportAnnounce)
+        },
         1000 * 60 * 10 // 10 minutes
     )
 
     const syncScore = idlePeriodic(
-        (again, cb) => readSheets(
-            mainSheetId,
-            'Score!A2:C',
-            (err, res) => {
-                if (err) {
-                    cb(err)
-                    again(reportScoreConsole)
-                    return
+        (next, cb) => {
+            readSheets(
+                mainSheetId,
+                'Score!A2:C',
+                (err, res) => {
+                    if (err) return cb(err)
+                    const {values} = res
+                    const reduced = values ? scoreReducer(values) : {
+                        plant: {log: [], total: 0},
+                        zombie: {log: [], total: 0}
+                    }
+                    fs.writeFile(scoreFile, JSON.stringify(reduced), cb)
                 }
-                const {values} = res
-                const reduced = values ? scoreReducer(values) : {
-                    plant: {log: [], total: 0},
-                    zombie: {log: [], total: 0}
-                }
-                fs.writeFile(scoreFile, JSON.stringify(reduced), cb)
-                again(reportScoreConsole)
-            }
-        ),
+            )
+            next(reportScore)
+        },
         1000 * 60 * 20 // 20 minutes
     )
 
-    const syncCompet = idlePeriodic(
-        (again, cb) => readSheets(
-            mainSheetId,
-            'Competition!A2:G',
-            (err, res) => {
-                if (err) {
-                    cb(err)
-                    again(reportCompetConsole)
-                    return
+    const syncLive = idlePeriodic(
+        (next, cb) => {
+            readSheets(
+                mainSheetId,
+                'Stream!A2:C',
+                (err, res) => {
+                    if (err) return cb(err)
+                    const {values} = res
+                    const reduced = values ? liveReducer(values) : null
+                    fs.writeFile(liveFile, JSON.stringify(reduced), cb)
                 }
-                const {values} = res
-                const cleaned = !values ? [] : values.map(
-                    (row) => {
-                        const [
-                            dateText,
-                            timeText,
-                            game,
-                            teamLeft,
-                            teamRight,
-                            result,
-                            stream
-                        ] = row
-                        const schedule = datetime.parse(
-                            `${dateText} ${timeText} +0700`,
-                            dateFormat
-                        )
-                        return {
-                            schedule,
-                            game,
-                            teamLeft,
-                            teamRight,
-                            result,
-                            stream
-                        }
-                    }
-                ).sort(
-                    (left, right) => {
-                        const elapse = datetime.subtract(
-                            left.schedule,
-                            right.schedule
-                        )
-                        return elapse.toMilliseconds()
-                    }
-                )
-                const now = new Date()
-                const incomingOffset = cleaned.findIndex(
-                    (row) => {
-                        const elapse = datetime.subtract(now, row.schedule)
-                        return elapse.toMilliseconds() < 0
-                    }
-                )
-                const liveSource =
-                    incomingOffset === -1 ?
-                    cleaned.reverse() :
-                    cleaned.slice(incomingOffset)
-                const availLive = liveSource.find((row) => !!row.stream)
-                const aggregator = aggregateCb(cb)
-                fs.writeFile(
-                    liveFile,
-                    JSON.stringify(availLive, undefToNull),
-                    aggregator('live', 'write live file')
-                )
-                fs.writeFile(
-                    competFile,
-                    JSON.stringify(cleaned),
-                    aggregator('compet', 'write competition file')
-                )
-                again(reportCompetConsole)
-            }
-        ),
-        1000 * 60 * 60 // 1 hour
+            )
+            next(reportAnnounce)
+        },
+        1000 * 60 * 10 // 10 minutes
     )
 
-    syncAnnounce(reportAnnounceConsole)
-    syncScore(reportScoreConsole)
-    syncCompet(reportCompetConsole)
+    const syncCompet = idlePeriodic(
+        (next, cb) => {
+            readSheets(
+                mainSheetId,
+                'Competition!A2:G',
+                (err, res) => {
+                    if (err) return cb(err)
+                    const {values} = res
+                    const reduced = values ? competReducer(values) : []
+                    fs.writeFile(competFile, JSON.stringify(reduced), cb)
+                }
+            )
+            next(reportCompet)
+        },
+        1000 * 60 * 40 // 40 minutes
+    )
+
+    syncAnnounce(reportAnnounce)
+    syncLive(reportLive)
+    syncScore(reportScore)
+    syncCompet(reportCompet)
 
     const updateRoute = express.Router()
 
     app.use('/update', updateRoute)
 
+    const updateOpts = {
+        endpoints: [
+            {name: 'announce', label: 'announce'},
+            {name: 'live', label: 'live'},
+            {name: 'score', label: 'score'},
+            {name: 'compet', label: 'competition'}
+        ]
+    }
+    updateRoute.get('/', (req, res) => res.render('update', updateOpts))
+
     const handleAnnounceHttp = handleHttp('announce', syncAnnounce)
     const handleScoreHttp = handleHttp('score', syncScore)
+    const handleLiveHttp = handleHttp('live', syncLive)
     const handleCompetHttp = handleHttp('competition', syncCompet)
 
-    updateRoute.get('/announce', handleAnnounceHttp)
-    updateRoute.get('/score', handleScoreHttp)
-    updateRoute.get('/compet', handleCompetHttp)
+    updateRoute.post('/announce', handleAnnounceHttp)
+    updateRoute.post('/live', handleLiveHttp)
+    updateRoute.post('/score', handleScoreHttp)
+    updateRoute.post('/compet', handleCompetHttp)
 }
